@@ -190,6 +190,11 @@ kbd{
 .danger{color:#C97B6E;border-color:#4A2E2A;background:#241A19}
 .danger:hover{border-color:#6E403A}
 .note{font-size:12px;color:var(--ink-faint);line-height:1.8;margin-top:14px}
+.resume{
+  margin:-6px 0 14px;padding:9px 13px;border-radius:9px;font-size:12.5px;
+  background:#1B2536;border:1px solid #3A4A63;border-left:3px solid var(--gold);
+  color:var(--ink-dim);transition:opacity .6s
+}
 .empty{text-align:center;padding:40px 10px;color:var(--ink-dim)}
 .empty h2{font-family:var(--serif);font-weight:400;font-size:26px;margin:0 0 8px;color:var(--ink)}
 
@@ -244,6 +249,8 @@ kbd{
   </div>
 </div>
 
+<p class="resume" id="resumeNote" style="display:none"></p>
+
 <main id="stage"></main>
 
 <div class="foot">
@@ -264,34 +271,40 @@ const POS = DATA.pos, ITEMS = DATA.items;   // [word, synonym, posIndex, chinese
 
 /* ================= 儲存層 ================= */
 const Store = (() => {
-  const KEY = 'ctw_toefl_progress_v1';
-  let mem = null, backend = 'memory';
-  async function load(){
+  const PREFIX = 'ctw_toefl_';
+  const mem = {}, timers = {};
+  let backend = 'memory';
+  async function get(key){
+    const k = PREFIX + key;
     try{
       if (window.storage && window.storage.get){
-        const r = await window.storage.get(KEY);
-        backend = 'artifact'; return r ? JSON.parse(r.value) : {};
+        backend = 'artifact';
+        const r = await window.storage.get(k);
+        return r ? JSON.parse(r.value) : null;
       }
-    }catch(e){ backend = 'artifact'; return {}; }
+    }catch(e){ backend = 'artifact'; return null; }
     try{
-      const v = localStorage.getItem(KEY);
-      localStorage.setItem(KEY+'_t','1'); localStorage.removeItem(KEY+'_t');
-      backend = 'local'; return v ? JSON.parse(v) : {};
+      localStorage.setItem(PREFIX + 'probe','1'); localStorage.removeItem(PREFIX + 'probe');
+      backend = 'local';
+      const v = localStorage.getItem(k);
+      return v ? JSON.parse(v) : null;
     }catch(e){}
-    mem = {}; return mem;
+    backend = 'memory';
+    return mem[k] ?? null;
   }
-  let t = null;
-  function save(obj){
-    clearTimeout(t);
-    t = setTimeout(async () => {
-      const s = JSON.stringify(obj);
+  function set(key, obj){
+    const k = PREFIX + key;
+    mem[k] = obj;
+    clearTimeout(timers[k]);
+    timers[k] = setTimeout(async () => {
+      const str = JSON.stringify(obj);
       try{
-        if (window.storage && window.storage.set){ await window.storage.set(KEY, s); return; }
+        if (window.storage && window.storage.set){ await window.storage.set(k, str); return; }
       }catch(e){ return; }
-      try{ localStorage.setItem(KEY, s); }catch(e){}
-    }, 250);
+      try{ localStorage.setItem(k, str); }catch(e){}
+    }, 200);
   }
-  return { load, save, kind: () => backend };
+  return { get, set, kind: () => backend };
 })();
 
 /* ================= 挖空規則 ================= */
@@ -376,6 +389,13 @@ function questionOf(i){
 let progress = {};          // { index: 1(需複習) | 2(精熟) }
 let pool = [], cursor = 0, q = null, revealed = false, tried = false;
 let scope = 'all', letter = 'all', posFilter = 'all', order = 'seq', autoNext = true;
+let resumeAt = null;
+
+function saveSession(){
+  Store.set('session_v1', {
+    i: q ? q.i : null, scope, letter, pos: posFilter, order, auto: autoNext
+  });
+}
 
 const $ = s => document.querySelector(s);
 const stage = $('#stage');
@@ -403,8 +423,9 @@ function go(d){
   cursor += d; render();
 }
 
-function rebuildPool(keepWord){
-  const prev = keepWord && q ? q.i : null;
+function rebuildPool(){
+  const prev = resumeAt !== null ? resumeAt : (q ? q.i : null);
+  resumeAt = null;
   pool = [];
   for (let i = 0; i < ITEMS.length; i++) if (passFilter(i)) pool.push(i);
   if (order === 'rand'){
@@ -433,7 +454,7 @@ function updateMeter(){
 
 function setState(i, v){
   if (v === 0) delete progress[i]; else progress[i] = v;
-  Store.save(progress); updateMeter();
+  Store.set('progress_v1', progress); updateMeter();
 }
 
 /* ================= 畫面 ================= */
@@ -441,13 +462,14 @@ function render(){
   if (!pool.length){
     stage.innerHTML = '<div class="card"><div class="empty"><h2>這個範圍沒有題目</h2>'
       + '<p>換一個練習範圍或篩選條件，就會有題目出現。</p></div></div>';
-    q = null; return;
+    q = null; saveSession(); return;
   }
   if (cursor >= pool.length) cursor = 0;
   if (cursor < 0) cursor = pool.length - 1;
 
   q = questionOf(pool[cursor]);
   revealed = false; tried = false;
+  saveSession();
   const st = progress[q.i] || 0;
   const stateTag = st === 2 ? '<span class="tag state-2">已精熟</span>'
                  : st === 1 ? '<span class="tag state-1">需複習</span>'
@@ -581,6 +603,7 @@ document.querySelectorAll('[data-scope]').forEach(b => {
 $('#btnAuto').onclick = e => {
   autoNext = !autoNext;
   e.currentTarget.setAttribute('aria-pressed', String(autoNext));
+  saveSession();
 };
 $('#selOrder').onchange = e => { order = e.target.value; rebuildPool(); };
 $('#selLetter').onchange = e => { letter = e.target.value; rebuildPool(); };
@@ -588,7 +611,7 @@ $('#selPos').onchange = e => { posFilter = e.target.value; rebuildPool(); };
 
 $('#btnReset').onclick = () => {
   if (!confirm('確定要清空所有練習紀錄嗎？此動作無法復原。')) return;
-  progress = {}; Store.save(progress); updateMeter(); rebuildPool();
+  progress = {}; Store.set('progress_v1', progress); updateMeter(); rebuildPool();
 };
 
 document.addEventListener('keydown', e => {
@@ -606,14 +629,37 @@ document.addEventListener('keydown', e => {
   $('#selPos').innerHTML = '<option value="all">全部詞性</option>'
     + POS.filter(p => p).map(p => `<option value="${p}">${p}</option>`).join('');
 
-  progress = await Store.load() || {};
+  progress = await Store.get('progress_v1') || {};
+
+  const sess = await Store.get('session_v1');
+  if (sess){
+    scope = sess.scope || 'all';
+    order = sess.order || 'seq';
+    autoNext = sess.auto !== false;
+    document.querySelectorAll('[data-scope]').forEach(x =>
+      x.setAttribute('aria-pressed', String(x.dataset.scope === scope)));
+    $('#selOrder').value = order;
+    $('#btnAuto').setAttribute('aria-pressed', String(autoNext));
+    $('#selLetter').value = sess.letter || 'all'; letter    = $('#selLetter').value;
+    $('#selPos').value    = sess.pos    || 'all'; posFilter = $('#selPos').value;
+    if (typeof sess.i === 'number') resumeAt = sess.i;
+  }
+
   updateMeter();
   rebuildPool();
 
+  if (sess && typeof sess.i === 'number' && q && q.i === sess.i && cursor > 0){
+    const n = $('#resumeNote');
+    n.textContent = `已回到上次停下的地方：第 ${cursor + 1} 題（${q.w}）。`;
+    n.style.display = 'block';
+    setTimeout(() => { n.style.opacity = '0'; }, 5000);
+    setTimeout(() => { n.style.display = 'none'; n.style.opacity = ''; }, 5600);
+  }
+
   const k = Store.kind();
   $('#storeNote').textContent = k === 'local'
-    ? '練習紀錄會存在這台裝置的瀏覽器裡，關掉分頁再回來也還在。換裝置或清除瀏覽資料會歸零。'
-    : '目前這個環境無法長期保存紀錄；把檔案下載到電腦後用瀏覽器開啟，進度就會自動存起來。';
+    ? '答題紀錄、目前的題號與篩選設定都存在這台裝置的瀏覽器裡，關掉再開會回到原本的位置。換裝置或清除瀏覽資料會歸零。'
+    : '目前這個環境無法長期保存紀錄；把檔案下載到電腦或手機後用瀏覽器開啟，題號與進度就會自動存起來。';
 })();
 </script>
 </body>
