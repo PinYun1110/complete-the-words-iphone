@@ -258,7 +258,7 @@ kbd{
 
 <div class="foot">
   <div class="keys">
-    <kbd>Enter</kbd> 送出／下一題 &nbsp; <kbd>?</kbd> 提示 &nbsp; <kbd>Esc</kbd> 看答案
+    打滿字母自動判定 &nbsp;·&nbsp; <kbd>Enter</kbd> 下一題 &nbsp; <kbd>?</kbd> 提示 &nbsp; <kbd>Esc</kbd> 看答案
   </div>
   <button class="danger" id="btnReset">重設所有進度</button>
 </div>
@@ -420,11 +420,21 @@ let progress = {};          // { index: 1(需複習) | 2(精熟) }
 let pool = [], cursor = 0, q = null, revealed = false, tried = false;
 let scope = 'all', letter = 'all', posFilter = 'all', order = 'seq', autoNext = true;
 let resumeAt = null;
+let marks = {};                       // 'scope|letter|pos' → 該組合下最後停留的單字
+const MARK_CAP = 40;                  // 上限，超過就淘汰最久沒用到的
+const SCOPE_LABEL = { all:'全部字彙', todo:'尚未精熟', wrong:'錯題本',
+                      new:'未練習過', hl:'近年考古題' };
+
+const markKey = () => scope + '|' + letter + '|' + posFilter;
 
 function saveSession(){
-  Store.set('session_v1', {
-    i: q ? q.i : null, scope, letter, pos: posFilter, order, auto: autoNext
-  });
+  if (q){
+    const k = markKey();
+    delete marks[k]; marks[k] = q.i;   // 重新插入以維持「最近使用」順序
+    const keys = Object.keys(marks);
+    if (keys.length > MARK_CAP) delete marks[keys[0]];
+  }
+  Store.set('session_v1', { scope, letter, pos: posFilter, order, auto: autoNext, marks });
 }
 
 const $ = s => document.querySelector(s);
@@ -454,8 +464,10 @@ function go(d){
   cursor += d; render();
 }
 
-function rebuildPool(){
-  const prev = resumeAt !== null ? resumeAt : (q ? q.i : null);
+function rebuildPool(announce){
+  // 優先順序：啟動時還原 → 這個範圍自己的書籤 → 目前這個字（該範圍還沒有書籤時）
+  const bookmark = resumeAt !== null ? resumeAt : marks[markKey()];
+  const carry = q ? q.i : null;
   resumeAt = null;
   pool = [];
   for (let i = 0; i < ITEMS.length; i++) if (passFilter(i)) pool.push(i);
@@ -465,9 +477,22 @@ function rebuildPool(){
       [pool[k], pool[j]] = [pool[j], pool[k]];
     }
   }
-  const at = prev !== null ? pool.indexOf(prev) : -1;
+  let at = (bookmark === undefined || bookmark === null) ? -1 : pool.indexOf(bookmark);
+  if (at < 0 && carry !== null) at = pool.indexOf(carry);
   cursor = at >= 0 ? at : 0;
   render();
+  if (announce && cursor > 0 && q){
+    banner(`已回到「${SCOPE_LABEL[scope]}」上次停下的第 ${cursor + 1} 題（${q.w}）。`);
+  }
+}
+
+function banner(text){
+  const n = $('#resumeNote');
+  n.textContent = text;
+  n.style.display = 'block'; n.style.opacity = '';
+  clearTimeout(banner.t1); clearTimeout(banner.t2);
+  banner.t1 = setTimeout(() => { n.style.opacity = '0'; }, 4500);
+  banner.t2 = setTimeout(() => { n.style.display = 'none'; n.style.opacity = ''; }, 5100);
 }
 
 /* ================= 進度統計 ================= */
@@ -540,15 +565,13 @@ function render(){
     <p class="feedback" id="feedback">&nbsp;</p>
 
     <div class="actions">
-      <button class="primary" id="btnCheck">送出答案</button>
+      <button class="ghost" id="btnPrev">← 上一題</button>
       <button id="btnHint">提示</button>
       <button id="btnShow">看答案</button>
-      <button class="ghost" id="btnPrev">上一題</button>
-      <button class="ghost" id="btnNext">下一題</button>
+      <button class="ghost" id="btnNext">下一題 →</button>
     </div>
   </div>`;
 
-  $('#btnCheck').onclick = check;
   $('#btnHint').onclick  = () => $('#hint').classList.toggle('show');
   $('#btnShow').onclick  = reveal;
   $('#btnPrev').onclick  = () => go(-1);
@@ -558,7 +581,7 @@ function render(){
   const typer = $('#typer');
   typer.addEventListener('input', onType);
   typer.addEventListener('keydown', e => {
-    if (e.key === 'Enter'){ e.preventDefault(); revealed ? go(1) : check(); }
+    if (e.key === 'Enter'){ e.preventDefault(); go(1); }
   });
   paint('');
   if (window.matchMedia('(min-width:700px)').matches) typer.focus();
@@ -583,10 +606,11 @@ function onType(e){
   if (raw.length === q.mask.hidden.length) check();
 }
 
+// 只由 onType 在字母填滿時呼叫；沒有手動送出，因此不會有「未填滿即判錯」的情況
 function check(){
-  if (revealed) { go(1); return; }
+  if (revealed) return;
   const val = $('#typer').value.replace(/[^A-Za-z]/g,'').toLowerCase();
-  if (!val.length) { $('#typer').focus(); return; }
+  if (val.length !== q.mask.hidden.length) return;
   const ok = val === q.mask.hidden.toLowerCase();
   const fb = $('#feedback'), sw = $('#slotwrap');
   if (ok){
@@ -597,15 +621,15 @@ function check(){
     fb.innerHTML = `答對了 &nbsp;<span class="ans">${q.w}</span>&nbsp; ${esc(q.zh)}`
                  + (tried ? '&nbsp;·&nbsp;先前答錯，已留在錯題本' : '');
     $('#typer').disabled = true;
-    $('#btnCheck').textContent = '下一題';
+    const nx = $('#btnNext'); nx.classList.remove('ghost'); nx.classList.add('primary');
     if (autoNext) setTimeout(() => { if (revealed) go(1); }, 850);
   } else {
     tried = true;
     setState(q.i, 1);
     sw.classList.remove('ok'); void sw.offsetWidth; sw.classList.add('bad');
     fb.className = 'feedback bad';
-    fb.textContent = '還不對，再看一次線索。需要的話可以按「提示」。';
-    setTimeout(() => { $('#typer').value = ''; paint(''); $('#typer').focus(); }, 260);
+    fb.innerHTML = `你輸入的是 <span class="ans">${esc(val)}</span>，還不對——再看一次線索，或按「提示」。`;
+    setTimeout(() => { $('#typer').value = ''; paint(''); $('#typer').focus(); }, 700);
   }
 }
 
@@ -620,7 +644,7 @@ function reveal(){
   const fb = $('#feedback');
   fb.className = 'feedback';
   fb.innerHTML = `答案是 &nbsp;<span class="ans">${q.w}</span>&nbsp; ${esc(q.zh)} &nbsp;·&nbsp; 已放進錯題本`;
-  $('#btnCheck').textContent = '下一題';
+  const nx = $('#btnNext'); nx.classList.remove('ghost'); nx.classList.add('primary');
 }
 
 /* ================= 控制列 ================= */
@@ -628,7 +652,7 @@ document.querySelectorAll('[data-scope]').forEach(b => {
   b.onclick = () => {
     document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed','false'));
     b.setAttribute('aria-pressed','true');
-    scope = b.dataset.scope; rebuildPool();
+    scope = b.dataset.scope; rebuildPool(true);
   };
 });
 $('#btnAuto').onclick = e => {
@@ -637,8 +661,8 @@ $('#btnAuto').onclick = e => {
   saveSession();
 };
 $('#selOrder').onchange = e => { order = e.target.value; rebuildPool(); };
-$('#selLetter').onchange = e => { letter = e.target.value; rebuildPool(); };
-$('#selPos').onchange = e => { posFilter = e.target.value; rebuildPool(); };
+$('#selLetter').onchange = e => { letter = e.target.value; rebuildPool(true); };
+$('#selPos').onchange = e => { posFilter = e.target.value; rebuildPool(true); };
 
 $('#btnReset').onclick = () => {
   if (!confirm('確定要清空所有練習紀錄嗎？此動作無法復原。')) return;
@@ -649,7 +673,7 @@ document.addEventListener('keydown', e => {
   if (!q) return;
   if (e.key === '?'){ e.preventDefault(); $('#hint').classList.toggle('show'); }
   if (e.key === 'Escape'){ e.preventDefault(); reveal(); }
-  if (e.key === 'Enter' && revealed){ e.preventDefault(); go(1); }
+  if (e.key === 'Enter'){ e.preventDefault(); go(1); }
 });
 
 /* ================= 啟動 ================= */
@@ -673,23 +697,21 @@ document.addEventListener('keydown', e => {
     $('#btnAuto').setAttribute('aria-pressed', String(autoNext));
     $('#selLetter').value = sess.letter || 'all'; letter    = $('#selLetter').value;
     $('#selPos').value    = sess.pos    || 'all'; posFilter = $('#selPos').value;
-    if (typeof sess.i === 'number') resumeAt = sess.i;
+    marks = sess.marks || {};
+    if (!sess.marks && typeof sess.i === 'number') marks[markKey()] = sess.i;  // 舊版紀錄
+    if (typeof marks[markKey()] === 'number') resumeAt = marks[markKey()];
   }
 
   updateMeter();
   rebuildPool();
 
-  if (sess && typeof sess.i === 'number' && q && q.i === sess.i && cursor > 0){
-    const n = $('#resumeNote');
-    n.textContent = `已回到上次停下的地方：第 ${cursor + 1} 題（${q.w}）。`;
-    n.style.display = 'block';
-    setTimeout(() => { n.style.opacity = '0'; }, 5000);
-    setTimeout(() => { n.style.display = 'none'; n.style.opacity = ''; }, 5600);
+  if (cursor > 0 && q){
+    banner(`已回到上次停下的地方：「${SCOPE_LABEL[scope]}」第 ${cursor + 1} 題（${q.w}）。`);
   }
 
   const k = Store.kind();
   $('#storeNote').textContent = k === 'local'
-    ? '答題紀錄、目前的題號與篩選設定都存在這台裝置的瀏覽器裡，關掉再開會回到原本的位置。換裝置或清除瀏覽資料會歸零。'
+    ? '每個練習範圍各自記住停在哪一題，互不干擾；答題紀錄與篩選設定也一併存在這台裝置的瀏覽器裡。換裝置或清除瀏覽資料會歸零。'
     : '目前這個環境無法長期保存紀錄；把檔案下載到電腦或手機後用瀏覽器開啟，題號與進度就會自動存起來。';
 })();
 </script>
