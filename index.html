@@ -215,7 +215,7 @@ kbd{
 <header>
   <p class="eyebrow">托福必備 · 高頻字彙 2,674</p>
   <h1>Complete <em>the</em> Words</h1>
-  <p class="sub">873 個近年考出過的字附真實語境句，其餘依 TOEFL 同義詞題型出題。</p>
+  <p class="sub">873 個近年考出過的字附真實語境句，其餘 1,801 字為同義題。</p>
 
   <div class="meter">
     <div class="meter-top">
@@ -234,21 +234,15 @@ kbd{
 <div class="controls">
   <div class="ctl-row">
     <span class="ctl-label">練習範圍</span>
-    <button class="chip" data-scope="all" aria-pressed="true">全部字彙</button>
-    <button class="chip" data-scope="todo" aria-pressed="false">尚未精熟</button>
-    <button class="chip" data-scope="wrong" aria-pressed="false">錯題本</button>
-    <button class="chip" data-scope="new" aria-pressed="false">未練習過</button>
+    <button class="chip" data-scope="syn" aria-pressed="true">同義題</button>
     <button class="chip" data-scope="hl" aria-pressed="false">近年考古題</button>
+    <button class="chip" data-scope="wrong" aria-pressed="false">錯題本</button>
   </div>
   <div class="ctl-row">
-    <span class="ctl-label">篩選與順序</span>
-    <select id="selLetter" aria-label="字母"></select>
-    <select id="selPos" aria-label="詞性"></select>
-    <select id="selOrder" aria-label="出題順序">
-      <option value="seq">依字典順序</option>
-      <option value="rand">隨機出題</option>
-    </select>
-    <button class="chip" id="btnShuffle" hidden>重新洗牌</button>
+    <span class="ctl-label">單元與選項</span>
+    <select id="selUnit" aria-label="單元"></select>
+    <button class="chip" id="btnShuffle">重新洗牌</button>
+    <button class="chip" id="btnSkip" aria-pressed="false">略過已精熟</button>
     <button class="chip" id="btnAuto" aria-pressed="true">答對自動跳下一題</button>
   </div>
 </div>
@@ -419,7 +413,7 @@ function questionOf(i){
 /* ================= 狀態 ================= */
 let progress = {};          // { index: 1(需複習) | 2(精熟) }
 let pool = [], cursor = 0, q = null, revealed = false, tried = false;
-let scope = 'all', letter = 'all', posFilter = 'all', order = 'seq', autoNext = true;
+let scope = 'syn', unit = 'all', autoNext = true, skipMastered = false;
 let resumeAt = null;
 let shuffleSeed = null;               // 隨機順序的種子，存起來才能重現同一個順序
 let marks = {};
@@ -435,10 +429,11 @@ function mulberry32(a){
 }
 const newSeed = () => (Date.now() ^ Math.floor(Math.random() * 0x7FFFFFFF)) >>> 0;                       // 'scope|letter|pos' → 該組合下最後停留的單字
 const MARK_CAP = 40;                  // 上限，超過就淘汰最久沒用到的
-const SCOPE_LABEL = { all:'全部字彙', todo:'尚未精熟', wrong:'錯題本',
-                      new:'未練習過', hl:'近年考古題' };
+const SCOPE_LABEL = { syn:'同義題', hl:'近年考古題', wrong:'錯題本' };
+const UNIT_COUNT  = { syn:37, hl:20 };
+const UNIT_SEED   = 20250816;          // 固定種子：單元成員每次開啟都相同
 
-const markKey = () => scope + '|' + letter + '|' + posFilter;
+const markKey = () => scope + '|' + unit;
 
 function saveSession(){
   if (q){
@@ -447,29 +442,68 @@ function saveSession(){
     const keys = Object.keys(marks);
     if (keys.length > MARK_CAP) delete marks[keys[0]];
   }
-  Store.set('session_v1', { scope, letter, pos: posFilter, order, auto: autoNext, marks, seed: shuffleSeed });
+  Store.set('session_v1', { v:2, scope, unit, auto: autoNext, skip: skipMastered, marks, seed: shuffleSeed });
 }
 
 const $ = s => document.querySelector(s);
 const stage = $('#stage');
 
-function passFilter(i){
-  const it = ITEMS[i], st = progress[i] || 0;
-  if (scope === 'todo'  && st === 2) return false;
-  if (scope === 'wrong' && st !== 1) return false;
-  if (scope === 'new'   && st !== 0) return false;
-  if (scope === 'hl'    && !HL.has(i)) return false;
-  if (letter !== 'all'){
-    const c = it[0].replace(/[^A-Za-z]/g,'').charAt(0).toUpperCase();
-    if (c !== letter) return false;
+// 以固定種子把一組字隨機且等量地切成 n 個單元
+function makeUnits(list, n){
+  const arr = list.slice(), rnd = mulberry32(UNIT_SEED);
+  for (let k = arr.length - 1; k > 0; k--){
+    const j = Math.floor(rnd() * (k + 1));
+    [arr[k], arr[j]] = [arr[j], arr[k]];
   }
-  if (posFilter !== 'all' && (POS[it[2]] || '') !== posFilter) return false;
+  const base = Math.floor(arr.length / n), extra = arr.length % n;
+  const units = [];
+  for (let u = 0, p = 0; u < n; u++){
+    const size = base + (u < extra ? 1 : 0);
+    units.push(arr.slice(p, p + size)); p += size;
+  }
+  return units;
+}
+
+const GROUP = { syn: [], hl: [] };
+for (let i = 0; i < ITEMS.length; i++) (HL.has(i) ? GROUP.hl : GROUP.syn).push(i);
+const UNITS  = { syn: makeUnits(GROUP.syn, UNIT_COUNT.syn),
+                 hl:  makeUnits(GROUP.hl,  UNIT_COUNT.hl) };
+const UNIT_OF = new Int16Array(ITEMS.length).fill(-1);
+for (const g of ['syn','hl']) UNITS[g].forEach((list, u) => list.forEach(i => { UNIT_OF[i] = u; }));
+
+function passFilter(i){
+  const st = progress[i] || 0;
+  if (scope === 'wrong') return st === 1;
+  if (scope === 'hl'  && !HL.has(i)) return false;
+  if (scope === 'syn' &&  HL.has(i)) return false;
+  if (unit !== 'all' && UNIT_OF[i] !== +unit) return false;
+  if (skipMastered && st === 2) return false;
   return true;
+}
+
+// 單元下拉：附上各單元完成度
+function fillUnits(){
+  const sel = $('#selUnit');
+  if (scope === 'wrong'){
+    sel.innerHTML = '<option value="all">全部錯題</option>';
+    sel.value = 'all'; sel.disabled = true; return;
+  }
+  sel.disabled = false;
+  const list = UNITS[scope];
+  const total = list.reduce((a, u) => a + u.length, 0);
+  const done  = list.reduce((a, u) => a + u.filter(i => progress[i] === 2).length, 0);
+  sel.innerHTML = `<option value="all">全部單元 · ${done}/${total}</option>`
+    + list.map((u, k) => {
+        const d = u.filter(i => progress[i] === 2).length;
+        return `<option value="${k}">單元 ${k + 1} · ${d}/${u.length}</option>`;
+      }).join('');
+  sel.value = unit;
+  if (sel.value !== String(unit)) { unit = 'all'; sel.value = 'all'; }
 }
 
 function go(d){
   if (!pool.length) return;
-  if (d > 0 && scope !== 'all' && !passFilter(pool[cursor])){
+  if (d > 0 && !passFilter(pool[cursor])){
     pool.splice(cursor, 1);
     if (cursor >= pool.length) cursor = 0;
     render(); return;
@@ -484,7 +518,7 @@ function rebuildPool(announce, restart){
   resumeAt = null;
   pool = [];
   for (let i = 0; i < ITEMS.length; i++) if (passFilter(i)) pool.push(i);
-  if (order === 'rand'){
+  {
     if (!shuffleSeed) shuffleSeed = newSeed();
     const rnd = mulberry32(shuffleSeed);
     for (let k = pool.length - 1; k > 0; k--){
@@ -572,8 +606,6 @@ function render(){
       <ol>
         <li>詞性線索：${POSHINT[q.kind]}${q.isPhrase && q.posZh ? '，字表標為<b>' + esc(q.posZh) + '</b>' : ''}。</li>
         <li>語意線索：同義詞是 <b>${q.clueHtml}</b>，中文是<span class="zh">「${esc(q.zh) || '—'}」</span>。</li>
-        ${q.real ? '<li>這是原表標記<b>近年考出過</b>的字，題幹為真實語境句。</li>' : ''}
-        <li>已給 <b>${m.shown}</b>，還缺 <b>${m.hidden.length}</b> 個字母。</li>
       </ol>
     </div>
 
@@ -667,7 +699,7 @@ document.querySelectorAll('[data-scope]').forEach(b => {
   b.onclick = () => {
     document.querySelectorAll('[data-scope]').forEach(x => x.setAttribute('aria-pressed','false'));
     b.setAttribute('aria-pressed','true');
-    scope = b.dataset.scope; rebuildPool(true);
+    scope = b.dataset.scope; unit = 'all'; fillUnits(); rebuildPool(true);
   };
 });
 $('#btnAuto').onclick = e => {
@@ -675,20 +707,19 @@ $('#btnAuto').onclick = e => {
   e.currentTarget.setAttribute('aria-pressed', String(autoNext));
   saveSession();
 };
-$('#selOrder').onchange = e => {
-  order = e.target.value;
-  syncShuffleBtn();
-  rebuildPool(order === 'rand');
+$('#btnSkip').onclick = e => {
+  skipMastered = !skipMastered;
+  e.currentTarget.setAttribute('aria-pressed', String(skipMastered));
+  rebuildPool(false);
 };
+// 只重排單元內的出題順序，不會更動單元成員
 $('#btnShuffle').onclick = () => {
   shuffleSeed = newSeed();
   delete marks[markKey()];
   rebuildPool(false, true);
-  banner('已重新洗牌，從新順序的第 1 題開始。');
+  banner('已重新洗牌，單元成員不變，從新順序的第 1 題開始。');
 };
-function syncShuffleBtn(){ $('#btnShuffle').hidden = (order !== 'rand'); }
-$('#selLetter').onchange = e => { letter = e.target.value; rebuildPool(true); };
-$('#selPos').onchange = e => { posFilter = e.target.value; rebuildPool(true); };
+$('#selUnit').onchange = e => { unit = e.target.value; rebuildPool(true); };
 
 $('#btnReset').onclick = () => {
   if (!confirm('確定要清空所有練習紀錄嗎？此動作無法復原。')) return;
@@ -704,32 +735,25 @@ document.addEventListener('keydown', e => {
 
 /* ================= 啟動 ================= */
 (async function init(){
-  const letters = [...new Set(ITEMS.map(x => x[0].replace(/[^A-Za-z]/g,'').charAt(0).toUpperCase()))].sort();
-  $('#selLetter').innerHTML = '<option value="all">全部字母</option>'
-    + letters.map(l => `<option value="${l}">${l} 開頭</option>`).join('');
-  $('#selPos').innerHTML = '<option value="all">全部詞性</option>'
-    + POS.filter(p => p).map(p => `<option value="${p}">${p}</option>`).join('');
-
   progress = await Store.get('progress_v1') || {};
 
   const sess = await Store.get('session_v1');
   if (sess){
-    scope = sess.scope || 'all';
-    order = sess.order || 'seq';
-    autoNext = sess.auto !== false;
+    scope = SCOPE_LABEL[sess.scope] ? sess.scope : 'syn';   // 舊版範圍名稱一律回到同義題
+    autoNext     = sess.auto !== false;
+    skipMastered = sess.skip === true;
+    shuffleSeed  = sess.seed || null;
+    marks = (sess.v === 2 && sess.marks) ? sess.marks : {};  // 舊版書籤鍵值結構已不同
+    unit  = (sess.unit === undefined || sess.unit === null) ? 'all' : sess.unit;
     document.querySelectorAll('[data-scope]').forEach(x =>
       x.setAttribute('aria-pressed', String(x.dataset.scope === scope)));
-    $('#selOrder').value = order; syncShuffleBtn();
     $('#btnAuto').setAttribute('aria-pressed', String(autoNext));
-    $('#selLetter').value = sess.letter || 'all'; letter    = $('#selLetter').value;
-    $('#selPos').value    = sess.pos    || 'all'; posFilter = $('#selPos').value;
-    marks = sess.marks || {};
-    shuffleSeed = sess.seed || null;
-    if (!sess.marks && typeof sess.i === 'number') marks[markKey()] = sess.i;  // 舊版紀錄
-    if (typeof marks[markKey()] === 'number') resumeAt = marks[markKey()];
+    $('#btnSkip').setAttribute('aria-pressed', String(skipMastered));
   }
 
   updateMeter();
+  fillUnits();
+  if (typeof marks[markKey()] === 'number') resumeAt = marks[markKey()];
   rebuildPool();
 
   if (cursor > 0 && q){
@@ -738,7 +762,7 @@ document.addEventListener('keydown', e => {
 
   const k = Store.kind();
   $('#storeNote').textContent = k === 'local'
-    ? '每個練習範圍各自記住停在哪一題，互不干擾；答題紀錄與篩選設定也一併存在這台裝置的瀏覽器裡。換裝置或清除瀏覽資料會歸零。'
+    ? '每個範圍的每個單元各自記住停在哪一題，互不干擾；答題紀錄與設定也一併存在這台裝置的瀏覽器裡。換裝置或清除瀏覽資料會歸零。'
     : '目前這個環境無法長期保存紀錄；把檔案下載到電腦或手機後用瀏覽器開啟，題號與進度就會自動存起來。';
 })();
 </script>
